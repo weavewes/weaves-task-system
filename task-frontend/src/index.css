@@ -1,0 +1,14 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    border-color: #eceae4;
+  }
+  body {
+    background-color: #f7f4ed;
+    color: #1c1c1c;
+    font-family: 'Camera Plain Variable', ui-sans-serif, system-ui, sans-serif;
+  }
+}
