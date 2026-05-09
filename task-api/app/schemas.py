@@ -238,12 +238,7 @@ class ClaimNextPayload(BaseModel):
     member_code: str
     worker_id: str
     lease_minutes: int = 15
-
-
-class ClaimNextResponse(BaseModel):
-    claimed: bool
-    message: Optional[str] = None
-    task: Optional[TaskResponse] = None
+    include_dependency_outputs: bool = False
 
 
 class HeartbeatPayload(BaseModel):
@@ -322,6 +317,43 @@ class LogListResponse(BaseModel):
     logs: list[TaskLogResponse]
 
 
+class TaskChainItem(BaseModel):
+    title: str
+    assigned_member_code: str
+    task_type: Optional[str] = "IMPLEMENTACION"
+    priority: Optional[int] = 5
+
+
+class TaskChainPayload(BaseModel):
+    project_id: Optional[int] = None
+    client_id: Optional[int] = None
+    created_by_member_code: Optional[str] = "NEXUS"
+    tasks: list[TaskChainItem]
+
+
+class TaskChainResponse(BaseModel):
+    total: int
+    tasks: list[TaskResponse]
+    dependencies: list[dict]
+
+
+class TaskDependencyResponse(BaseModel):
+    id: int
+    task_id: int
+    depends_on_task_id: int
+    dependency_type: str
+    is_required: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class TaskDependencyListResponse(BaseModel):
+    task_id: int
+    dependencies: list[TaskDependencyResponse]
+
+
 # ─────────────────────────────────────────────
 # Health
 # ─────────────────────────────────────────────
@@ -330,3 +362,59 @@ class HealthResponse(BaseModel):
     status: str
     service: str
     version: Optional[str] = "1.0.0"
+
+
+# ─────────────────────────────────────────────
+# Task Outputs
+# ─────────────────────────────────────────────
+
+class TaskOutputCreate(BaseModel):
+    member_code: str
+    output_type: str = "TEXT"
+    title: Optional[str] = None
+    content: Optional[str] = None
+    file_url: Optional[str] = None
+    file_path: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+
+
+class TaskOutputResponse(BaseModel):
+    id: int
+    task_id: int
+    created_by_member_id: Optional[int] = None
+    output_type: str
+    title: Optional[str] = None
+    content: Optional[str] = None
+    file_url: Optional[str] = None
+    file_path: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class TaskOutputListResponse(BaseModel):
+    task_id: int
+    outputs: list[TaskOutputResponse]
+
+
+class DependencyOutputItem(BaseModel):
+    id: int
+    source_task_id: int
+    source_task_title: str
+    created_by: str
+    output_type: str
+    title: Optional[str] = None
+    content: Optional[str] = None
+    file_url: Optional[str] = None
+    file_path: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+    created_at: datetime
+
+
+class ClaimNextResponse(BaseModel):
+    claimed: bool
+    message: Optional[str] = None
+    task: Optional[TaskResponse] = None
+    dependency_outputs: Optional[list[DependencyOutputItem]] = None

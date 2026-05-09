@@ -59,6 +59,34 @@ export const api = {
       request<import('./types').EventsResponse>(`/tasks/${id}/events`),
     logs: (id: string) =>
       request<import('./types').LogsResponse>(`/tasks/${id}/logs`),
+    blocking: (id: string) =>
+      request<{ total: number; items: import('./types').Task[] }>(`/tasks/${id}/blocking`),
+    update: (id: string, data: Partial<import('./types').Task>) =>
+      request<import('./types').Task>(`/tasks/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(data),
+      }),
+    outputs: {
+      list: (taskId: string) =>
+        request<{ task_id: number; outputs: import('./types').TaskOutput[] }>(`/tasks/${taskId}/outputs`),
+      dependencyList: (taskId: string) =>
+        request<import('./types').DependencyOutputItem[]>(`/tasks/${taskId}/dependency-outputs`),
+      create: (taskId: string, data: {
+        member_code: string
+        output_type: string
+        title: string
+        content?: string
+        file_url?: string
+        file_path?: string
+        metadata?: Record<string, unknown>
+      }) =>
+        request<import('./types').TaskOutput>(`/tasks/${taskId}/outputs`, {
+          method: 'POST',
+          body: JSON.stringify(data),
+        }),
+      downloadUrl: (taskId: string, outputId: number) =>
+        `${API_BASE}/tasks/${taskId}/outputs/${outputId}/download`,
+    },
   },
 
   // Projects

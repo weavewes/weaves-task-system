@@ -1,6 +1,6 @@
 -- ================================================
 -- WEAVES TASK SYSTEM - Schema de Base de Datos
--- Versión: 3.2 (2026-05-07)
+-- Versión: 3.3 (2026-05-08) — task_outputs added
 -- ================================================
 
 -- Tabla de clientes (v2.1)
@@ -80,6 +80,7 @@ CREATE TABLE tasks (
     requiere_aprobacion BOOLEAN DEFAULT FALSE,
     bloqueada_por VARCHAR(150),
     motivo_bloqueo TEXT,
+    blocked_reason TEXT,
     fecha_ultimo_seguimiento TIMESTAMP,
     proxima_accion TEXT,
     source VARCHAR(100),
@@ -110,6 +111,22 @@ CREATE TABLE task_events (
     metadata JSONB,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Tabla de dependencias entre tareas (v1.0)
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    id SERIAL PRIMARY KEY,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    depends_on_task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    dependency_type VARCHAR(50) DEFAULT 'FINISH_TO_START',
+    is_required BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT no_self_dependency CHECK (task_id <> depends_on_task_id),
+    CONSTRAINT valid_dependency_type CHECK (dependency_type IN ('FINISH_TO_START', 'START_TO_START', 'FINISH_TO_FINISH', 'BLOCKS')),
+    CONSTRAINT unique_task_dependency UNIQUE (task_id, depends_on_task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_task_id ON task_dependencies(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_depends_on_task_id ON task_dependencies(depends_on_task_id);
 
 -- Tabla de logs de tareas (v1.0)
 CREATE TABLE task_logs (
@@ -157,6 +174,31 @@ CREATE TABLE miembros (
     CONSTRAINT valid_estado_miembro CHECK (estado IN ('ACTIVO', 'INACTIVO', 'SUSPENDIDO', 'ELIMINADO')),
     CONSTRAINT valid_disponibilidad_miembro CHECK (disponibilidad_actual IN ('DISPONIBLE', 'OCUPADO', 'AUSENTE', 'VACACIONES', 'NO_CONTACTAR'))
 );
+
+-- ================================================
+-- Task Outputs (v1.0)
+-- ================================================
+
+CREATE TABLE IF NOT EXISTS task_outputs (
+    id SERIAL PRIMARY KEY,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    created_by_member_id INTEGER REFERENCES miembros(id) ON DELETE SET NULL,
+    output_type VARCHAR(50) NOT NULL DEFAULT 'TEXT',
+    title VARCHAR(255),
+    content TEXT,
+    file_url TEXT,
+    file_path TEXT,
+    metadata JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT valid_output_type CHECK (
+        output_type IN ('TEXT', 'MARKDOWN', 'JSON', 'FILE_URL', 'FILE_PATH', 'IMAGE_URL', 'DOCUMENT_URL', 'SUMMARY', 'BRIEF', 'REPORT')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_outputs_task_id ON task_outputs(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_outputs_created_by_member_id ON task_outputs(created_by_member_id);
+CREATE INDEX IF NOT EXISTS idx_task_outputs_output_type ON task_outputs(output_type);
+CREATE INDEX IF NOT EXISTS idx_task_outputs_metadata ON task_outputs USING GIN (metadata);
 
 -- ================================================
 -- DATOS BASE - Miembros del Equipo (v2.0)

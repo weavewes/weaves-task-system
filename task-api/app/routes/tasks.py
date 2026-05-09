@@ -27,6 +27,20 @@ from app.schemas import (
     ClientResponse,
     ProjectResponse,
     MemberResponse,
+    TaskChainPayload,
+    TaskChainResponse,
+    TaskDependencyResponse,
+    TaskDependencyListResponse,
+    TaskOutputCreate,
+    TaskOutputResponse,
+    TaskOutputListResponse,
+    DependencyOutputItem,
+)
+
+from app.services.task_outputs import (
+    create_task_output,
+    list_task_outputs,
+    get_dependency_outputs,
 )
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -397,7 +411,17 @@ async def claim_next(payload: ClaimNextPayload):
 
         # Fetch updated task
         task_row = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
-        return ClaimNextResponse(claimed=True, task=dict(task_row))
+
+        # Fetch dependency outputs if requested
+        dependency_outputs = None
+        if payload.include_dependency_outputs:
+            dependency_outputs = await get_dependency_outputs(task_id)
+
+        return ClaimNextResponse(
+            claimed=True,
+            task=dict(task_row),
+            dependency_outputs=dependency_outputs,
+        )
 
     except HTTPException:
         raise
@@ -507,6 +531,53 @@ async def complete_task(task_id: int, payload: CompletePayload, db: AsyncSession
         await register_log(conn, task_id, member_id, "INFO",
                            f"Task completed. Status: {new_status}. Notes: {payload.agent_notes}",
                            {"result_payload": payload.result_payload})
+
+        # ── DEPENDENCY UNBLOCK ──
+        # Find all tasks that depend on this one and check if they should unblock
+        if new_status == "COMPLETADA":
+            # Explicitly flush and commit the status update BEFORE reading dependency state
+            await db.flush()
+            await db.commit()
+            tasks_to_unblock = []
+            dependent_rows = await conn.fetch(
+                """
+                SELECT td.task_id, td.depends_on_task_id, td.is_required
+                FROM task_dependencies td
+                JOIN tasks t ON t.id = td.task_id
+                WHERE td.depends_on_task_id = $1 AND td.is_required = TRUE
+                  AND t.status = 'BLOQUEADA'
+                """,
+                task_id
+            )
+            for drow in dependent_rows:
+                dep_task_id = drow["task_id"]
+                # Verify ALL required dependencies are COMPLETADA using SUM trick
+                required_deps = await conn.fetch(
+                    """
+                    SELECT COUNT(*) as total,
+                           SUM(CASE WHEN dep.status = 'COMPLETADA' THEN 1 ELSE 0 END) as completed
+                    FROM task_dependencies td
+                    JOIN tasks dep ON dep.id = td.depends_on_task_id
+                    WHERE td.task_id = $1 AND td.is_required = TRUE
+                    """,
+                    dep_task_id
+                )
+                r = dict(required_deps[0])
+                if r["total"] == r["completed"]:
+                    tasks_to_unblock.append(dep_task_id)
+
+            for dep_task_id in tasks_to_unblock:
+                await conn.execute(
+                    "UPDATE tasks SET status = 'PENDIENTE', blocked_reason = NULL, "
+                    "updated_at = NOW() WHERE id = $1",
+                    dep_task_id
+                )
+                await register_event(
+                    conn, dep_task_id, "TASK_UNBLOCKED", "BLOQUEADA", "PENDIENTE",
+                    f"Task unblocked — all required dependencies completed (task {task_id} done)",
+                    member_id
+                )
+
         await conn.execute("COMMIT")
     finally:
         await conn.close()
@@ -697,3 +768,391 @@ async def add_task_log(task_id: int, payload: TaskLogCreate, db: AsyncSession = 
     row = result.fetchone()
     await db.commit()
     return dict(row._mapping)
+
+# ─────────────────────────────────────────────
+# POST /workflows/task-chain
+# ─────────────────────────────────────────────
+@router.post("/workflows/task-chain", response_model=TaskChainResponse, status_code=201)
+async def create_task_chain(payload: TaskChainPayload):
+    """
+    Create a chain of tasks where each task (after the first) depends on the previous one.
+    The first task starts as PENDIENTE; all subsequent tasks start as BLOQUEADA.
+    """
+    conn = await get_async_connection()
+    try:
+        # Resolve creator
+        created_by_id = None
+        if payload.created_by_member_code:
+            row = await conn.fetchrow(
+                "SELECT id FROM miembros WHERE codigo = $1 AND estado = 'ACTIVO'",
+                payload.created_by_member_code.upper()
+            )
+            created_by_id = row["id"] if row else None
+
+        created_tasks = []
+        dependencies = []
+
+        for i, item in enumerate(payload.tasks):
+            # Resolve assigned member
+            assigned_id = None
+            row = await conn.fetchrow(
+                "SELECT id FROM miembros WHERE codigo = $1 AND estado = 'ACTIVO'",
+                item.assigned_member_code.upper()
+            )
+            assigned_id = row["id"] if row else None
+
+            # Generate codigo
+            next_id_row = await conn.fetchrow(
+                "SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM tasks"
+            )
+            next_id = next_id_row["next_id"]
+            codigo = f"TASK-{next_id:04d}"
+
+            # First task: PENDIENTE. Others: BLOQUEADA
+            if i == 0:
+                status = "PENDIENTE"
+            else:
+                status = "BLOQUEADA"
+
+            task_row = await conn.fetchrow(
+                """
+                INSERT INTO tasks (
+                    codigo, title, description,
+                    status, priority, task_type,
+                    client_id, project_id,
+                    assigned_member_id, created_by_member_id
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                RETURNING *
+                """,
+                codigo,
+                item.title,
+                item.title,  # description = title for now
+                status,
+                item.priority or 5,
+                item.task_type or "IMPLEMENTACION",
+                payload.client_id,
+                payload.project_id,
+                assigned_id,
+                created_by_id,
+            )
+            created_tasks.append(dict(task_row))
+
+            # Register event
+            event_type = "TASK_CREATED" if i == 0 else "TASK_BLOCKED_BY_DEPENDENCY"
+            event_msg = f"Task '{codigo}' created as first in chain" if i == 0 else \
+                f"Task '{codigo}' created and blocked — waiting for task {created_tasks[i-1]['id']} to complete"
+            await register_event(
+                conn, task_row["id"], event_type,
+                None, status, event_msg, created_by_id
+            )
+
+            # If not first task, create dependency on previous task
+            if i > 0:
+                dep_row = await conn.fetchrow(
+                    """
+                    INSERT INTO task_dependencies (task_id, depends_on_task_id, dependency_type, is_required)
+                    VALUES ($1, $2, 'FINISH_TO_START', TRUE)
+                    RETURNING *
+                    """,
+                    task_row["id"],
+                    created_tasks[i - 1]["id"],
+                )
+                dependencies.append(dict(dep_row))
+
+                # Update blocked_reason
+                await conn.execute(
+                    "UPDATE tasks SET blocked_reason = $1 WHERE id = $2",
+                    f"Waiting for task {created_tasks[i-1]['codigo']} to complete",
+                    task_row["id"],
+                )
+
+        await conn.execute("COMMIT")
+        return TaskChainResponse(total=len(created_tasks), tasks=created_tasks, dependencies=dependencies)
+
+    except Exception as e:
+        await conn.execute("ROLLBACK")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await conn.close()
+
+
+# ─────────────────────────────────────────────
+# GET /tasks/{task_id}/dependencies
+# ─────────────────────────────────────────────
+@router.get("/{task_id}/dependencies", response_model=TaskDependencyListResponse)
+async def get_task_dependencies(task_id: int, db: AsyncSession = Depends(get_db)):
+    """Get all tasks that THIS task depends on (i.e., the tasks that must complete first)."""
+    result = await db.execute(
+        text("""
+            SELECT td.*, t.codigo as depends_on_codigo, t.title as depends_on_title, t.status as depends_on_status
+            FROM task_dependencies td
+            JOIN tasks t ON t.id = td.depends_on_task_id
+            WHERE td.task_id = :id
+            ORDER BY td.created_at ASC
+        """),
+        {"id": task_id}
+    )
+    rows = result.fetchall()
+    deps = [dict(row._mapping) for row in rows]
+    return TaskDependencyListResponse(task_id=task_id, dependencies=[
+        TaskDependencyResponse(
+            id=d["id"],
+            task_id=d["task_id"],
+            depends_on_task_id=d["depends_on_task_id"],
+            dependency_type=d["dependency_type"],
+            is_required=d["is_required"],
+            created_at=d["created_at"],
+        )
+        for d in deps
+    ])
+
+
+# ─────────────────────────────────────────────
+# GET /tasks/{task_id}/blocked-by
+# ─────────────────────────────────────────────
+@router.get("/{task_id}/blocked-by", response_model=TaskDependencyListResponse)
+async def get_task_blocked_by(task_id: int, db: AsyncSession = Depends(get_db)):
+    """Get all tasks that block THIS task (i.e., tasks that must complete before this one)."""
+    result = await db.execute(
+        text("""
+            SELECT td.*, t.codigo, t.title, t.status
+            FROM task_dependencies td
+            JOIN tasks t ON t.id = td.task_id
+            WHERE td.depends_on_task_id = :id
+            ORDER BY td.created_at ASC
+        """),
+        {"id": task_id}
+    )
+    rows = result.fetchall()
+    return TaskDependencyListResponse(task_id=task_id, dependencies=[
+        TaskDependencyResponse(
+            id=d["id"],
+            task_id=d["task_id"],
+            depends_on_task_id=d["depends_on_task_id"],
+            dependency_type=d["dependency_type"],
+            is_required=d["is_required"],
+            created_at=d["created_at"],
+        )
+        for d in [dict(row._mapping) for row in rows]
+    ])
+
+
+# ─────────────────────────────────────────────
+# GET /tasks/{task_id}/unblocks
+# ─────────────────────────────────────────────
+@router.get("/{task_id}/unblocks", response_model=TaskDependencyListResponse)
+async def get_task_unblocks(task_id: int, db: AsyncSession = Depends(get_db)):
+    """Get all tasks that THIS task unblocks when it completes."""
+    result = await db.execute(
+        text("""
+            SELECT td.*, t.codigo, t.title, t.status
+            FROM task_dependencies td
+            JOIN tasks t ON t.id = td.task_id
+            WHERE td.depends_on_task_id = :id
+            ORDER BY td.created_at ASC
+        """),
+        {"id": task_id}
+    )
+    rows = result.fetchall()
+    return TaskDependencyListResponse(task_id=task_id, dependencies=[
+        TaskDependencyResponse(
+            id=d["id"],
+            task_id=d["task_id"],
+            depends_on_task_id=d["depends_on_task_id"],
+            dependency_type=d["dependency_type"],
+            is_required=d["is_required"],
+            created_at=d["created_at"],
+        )
+        for d in [dict(row._mapping) for row in rows]
+    ])
+
+
+# ─────────────────────────────────────────────
+# POST /tasks/{task_id}/dependencies — add dependency
+# ─────────────────────────────────────────────
+@router.post("/{task_id}/dependencies", response_model=TaskDependencyResponse, status_code=201)
+async def add_task_dependency(task_id: int, depends_on_task_id: int, db: AsyncSession = Depends(get_db)):
+    """Manually add a dependency: task_id depends on depends_on_task_id."""
+    # Verify both tasks exist
+    t1 = await db.execute(text("SELECT id FROM tasks WHERE id = :id"), {"id": task_id})
+    if not t1.fetchone():
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    t2 = await db.execute(text("SELECT id FROM tasks WHERE id = :id"), {"id": depends_on_task_id})
+    if not t2.fetchone():
+        raise HTTPException(status_code=404, detail=f"Task {depends_on_task_id} not found")
+
+    if task_id == depends_on_task_id:
+        raise HTTPException(status_code=400, detail="A task cannot depend on itself")
+
+    conn = await get_async_connection()
+    try:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO task_dependencies (task_id, depends_on_task_id, dependency_type, is_required)
+            VALUES ($1, $2, 'FINISH_TO_START', TRUE)
+            ON CONFLICT (task_id, depends_on_task_id) DO NOTHING
+            RETURNING *
+            """,
+            task_id, depends_on_task_id
+        )
+        if not row:
+            raise HTTPException(status_code=409, detail="Dependency already exists")
+        await conn.execute("COMMIT")
+        return dict(row)
+    except HTTPException:
+        raise
+    except Exception as e:
+        await conn.execute("ROLLBACK")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await conn.close()
+
+
+# ─────────────────────────────────────────────
+# DELETE /tasks/{task_id}/dependencies/{dep_id}
+# ─────────────────────────────────────────────
+@router.delete("/{task_id}/dependencies/{dep_id}", status_code=204)
+async def delete_task_dependency(task_id: int, dep_id: int, db: AsyncSession = Depends(get_db)):
+    """Remove a dependency."""
+    conn = await get_async_connection()
+    try:
+        result = await conn.execute(
+            "DELETE FROM task_dependencies WHERE id = $1 AND task_id = $2",
+            dep_id, task_id
+        )
+        if result == "DELETE 0":
+            raise HTTPException(status_code=404, detail="Dependency not found")
+        await conn.execute("COMMIT")
+    except HTTPException:
+        raise
+    except Exception as e:
+        await conn.execute("ROLLBACK")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await conn.close()
+
+
+# ─────────────────────────────────────────────
+# POST /tasks/{task_id}/outputs — create output
+# ─────────────────────────────────────────────
+@router.post("/{task_id}/outputs", response_model=TaskOutputResponse, status_code=201)
+async def create_output(task_id: int, payload: TaskOutputCreate, db: AsyncSession = Depends(get_db)):
+    """Attach an output/deliverable to a task."""
+    # Verify task exists
+    result = await db.execute(text("SELECT id FROM tasks WHERE id = :id"), {"id": task_id})
+    if not result.fetchone():
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+    valid_types = {"TEXT", "MARKDOWN", "JSON", "FILE_URL", "FILE_PATH",
+                   "IMAGE_URL", "DOCUMENT_URL", "SUMMARY", "BRIEF", "REPORT"}
+    if payload.output_type not in valid_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"output_type must be one of: {sorted(valid_types)}"
+        )
+
+    output = await create_task_output(task_id, payload)
+    return output
+
+
+# ─────────────────────────────────────────────
+# GET /tasks/{task_id}/outputs — list outputs
+# ─────────────────────────────────────────────
+@router.get("/{task_id}/outputs", response_model=TaskOutputListResponse)
+async def get_outputs(task_id: int, db: AsyncSession = Depends(get_db)):
+    """List all outputs for a task."""
+    # Verify task exists
+    result = await db.execute(text("SELECT id FROM tasks WHERE id = :id"), {"id": task_id})
+    if not result.fetchone():
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+    outputs = await list_task_outputs(task_id)
+    return TaskOutputListResponse(task_id=task_id, outputs=outputs)
+
+
+# ─────────────────────────────────────────────
+# GET /tasks/{task_id}/dependency-outputs — outputs from tasks this depends on
+# ─────────────────────────────────────────────
+@router.get("/{task_id}/dependency-outputs", response_model=list[DependencyOutputItem])
+async def get_task_dependency_outputs(task_id: int, db: AsyncSession = Depends(get_db)):
+    """Get all outputs from tasks that this task depends on."""
+    # Verify task exists
+    result = await db.execute(text("SELECT id FROM tasks WHERE id = :id"), {"id": task_id})
+    if not result.fetchone():
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+    outputs = await get_dependency_outputs(task_id)
+    return outputs
+
+
+# ─────────────────────────────────────────────
+# GET /tasks/{task_id}/outputs/{output_id}/download — serve output content/file
+# ─────────────────────────────────────────────
+@router.get("/{task_id}/outputs/{output_id}/download")
+async def download_output(task_id: int, output_id: int):
+    """
+    Download an output by its ID. Returns the raw content as a file attachment.
+    - FILE_URL / IMAGE_URL / DOCUMENT_URL → redirect to file_url
+    - FILE_PATH → serve file from disk via FileResponse
+    - TEXT / MARKDOWN / JSON / SUMMARY / BRIEF / REPORT → return content as text download
+    """
+    conn = await get_async_connection()
+    try:
+        row = await conn.fetchrow(
+            "SELECT * FROM task_outputs WHERE id = $1 AND task_id = $2",
+            output_id, task_id
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Output not found")
+
+        output = dict(row)
+        import json as _json
+        if output.get("metadata") and isinstance(output["metadata"], str):
+            output["metadata"] = _json.loads(output["metadata"])
+
+        content_type_map = {
+            "IMAGE_URL": "image/png",
+            "DOCUMENT_URL": "application/pdf",
+            "FILE_URL": "application/octet-stream",
+            "FILE_PATH": "application/octet-stream",
+            "TEXT": "text/plain",
+            "MARKDOWN": "text/markdown",
+            "JSON": "application/json",
+        }
+
+
+        output_type = output.get("output_type", "TEXT")
+
+
+        if output_type in ("FILE_URL", "IMAGE_URL", "DOCUMENT_URL"):
+            file_url = output.get("file_url")
+            if not file_url:
+                raise HTTPException(status_code=404, detail="No file URL associated with this output")
+            from fastapi import RedirectResponse
+            return RedirectResponse(file_url, status_code=302)
+
+        elif output_type == "FILE_PATH":
+            file_path = output.get("file_path")
+            if not file_path:
+                raise HTTPException(status_code=404, detail="No file path associated with this output")
+            from fastapi.responses import FileResponse
+            import os
+            filename = os.path.basename(file_path)
+            return FileResponse(
+                path=file_path,
+                filename=filename,
+                media_type=content_type_map.get(output_type, "application/octet-stream"),
+            )
+
+        else:
+            # TEXT, MARKDOWN, JSON, SUMMARY, BRIEF, REPORT
+            content = output.get("content") or ""
+            media_type = content_type_map.get(output_type, "text/plain")
+            from fastapi.responses import Response
+            return Response(
+                content=content,
+                media_type=media_type,
+                headers={"Content-Disposition": f"attachment; filename=\"output-{output_id}.txt\""},
+            )
+    finally:
+        await conn.close()

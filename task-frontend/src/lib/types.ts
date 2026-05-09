@@ -187,3 +187,29 @@ export interface Member {
   created_at: string
   updated_at: string
 }
+
+export interface TaskOutput {
+  id: number
+  task_id: number
+  created_by_member_id: number | null
+  output_type: string
+  title: string | null
+  content: string | null
+  file_url: string | null
+  file_path: string | null
+  metadata: Record<string, unknown> | null
+  created_at: string
+}
+
+export interface DependencyOutputItem {
+  source_task_id: number
+  source_task_title: string
+  created_by: string
+  output_type: string
+  title: string | null
+  content: string | null
+  file_url: string | null
+  file_path: string | null
+  metadata: Record<string, unknown> | null
+  created_at: string
+}
